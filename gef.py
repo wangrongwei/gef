@@ -65,6 +65,7 @@ import importlib
 import importlib.util
 import inspect
 import itertools
+import mmap
 import os
 import pathlib
 import platform
@@ -76,6 +77,7 @@ import string
 import struct
 import subprocess
 import sys
+import signal
 import tempfile
 import time
 import traceback
@@ -144,6 +146,11 @@ BP_GLYPH                               = "●"
 GEF_PROMPT                             = "gef➤  "
 GEF_PROMPT_ON                          = f"\001\033[1;32m\002{GEF_PROMPT}\001\033[0m\002"
 GEF_PROMPT_OFF                         = f"\001\033[1;31m\002{GEF_PROMPT}\001\033[0m\002"
+
+shared_view = "~/.gef/shared_view"
+shared_mm = 0
+shared_dict = {}
+shared_dict["regs_index"] = 0
 
 __registered_commands__ : Set[Type["GenericCommand"]]                                        = set()
 __registered_functions__ : Set[Type["GenericFunction"]]                                      = set()
@@ -228,6 +235,24 @@ def gef_print(*args: str, end="\n", sep=" ", **kwargs: Any) -> None:
     print(*parts, sep=sep, end=end, **kwargs)
     return
 
+def gef_shared_print(pipe_name: str, *args: str, n: int, end="\n", sep=" ") -> None:
+    """Ignore SIGPIPE."""
+    file_path = os.path.expanduser('~/.gef/shared_view')
+    # boil out if not exists
+    if not os.path.exists(file_path):
+        return
+
+    parts = [highlight_text(a) for a in args]
+    shared_dict["regs"] = parts
+    shared_dict["regs_time"] = time.ctime() # time stamp
+
+    # make sure no any overlaps
+    pos = shared_dict["regs_index"] * 2048 + ((n-1) // 3) * 192
+    byte_buffer = bytearray(b"\n".join(s.encode('utf-8') for s in parts))
+    byte_buffer += b"\n"
+    pos_end = pos + len(byte_buffer)
+    shared_mm[pos:pos+192] = b"\x00" * 192
+    shared_mm[pos:pos_end] = byte_buffer
 
 def bufferize(f: Callable) -> Callable:
     """Store the content to be printed for a function in memory, and flush it on function exit."""
@@ -3628,6 +3653,12 @@ def exit_handler(_: "gdb.events.ExitedEvent") -> None:
     global gef
     # flush the caches
     reset_all_caches()
+
+    # close fd
+    shared_file = os.path.expanduser('~/.gef/shared_view')
+    if os.path.exists(shared_file):
+        shared_mm.close()
+        os.remove(shared_file)
 
     # disconnect properly the remote session
     gef.session.qemu_mode = False
@@ -7580,11 +7611,14 @@ class ContextCommand(GenericCommand):
 
             if i % nb == 0:
                 gef_print(line)
+                gef_shared_print("shared_view", line, n=i)
+
                 line = ""
             i += 1
 
         if line:
             gef_print(line)
+            gef_shared_print("shared_view", line, n=i)
 
         gef_print(f"Flags: {gef.arch.flag_register_to_human()}")
         return
@@ -11542,6 +11576,11 @@ if __name__ == "__main__":
         new_objfile_handler(None)
 
     GefTmuxSetup()
+
+    shared_mmap_path = os.path.expanduser('~/.gef/shared_view')
+    with open(shared_mmap_path, "w+b") as f:
+        f.truncate(1024 * 4)
+        shared_mm = mmap.mmap(f.fileno(), 1024 * 4, access=mmap.ACCESS_WRITE)
 
     if GDB_VERSION > (9, 0):
         disable_tr_overwrite_setting = "gef.disable_target_remote_overwrite"
